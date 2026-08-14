@@ -6,6 +6,12 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import dns from "node:dns";
+/* GitHub Actions runners frequently resolve AAAA (IPv6) records but have no
+ * IPv6 route, so undici's fetch tries IPv6 first and fails hard with
+ * "TypeError: fetch failed" (no IPv4 fallback on some Node versions). Prefer
+ * IPv4 so outbound provider/embedding calls are not dropped at connection time. */
+dns.setDefaultResultOrder("ipv4first");
 
 const JOB_ID = process.env.JOB_ID;
 const JOB_SECRET = process.env.JOB_SECRET;
@@ -542,6 +548,9 @@ function chatRoute(spec, model) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/* Upper bound for one (non-streamed) completion request. */
+const MODEL_TIMEOUT_MS = 1000 * 60 * 10;
+
 /* Per-minute rate limits: wait 10s and retry (up to ~50 minutes of waiting).
  * Transient network/5xx failures back off and retry a few times.
  * Any other limit (quota / credits / context) stops the run with the
@@ -553,18 +562,45 @@ async function callModel(spec, messages, opts = {}) {
   let transient = 0;
   for (;;) {
     let res;
+    // The completion is not streamed, so nothing arrives until the model has
+    // finished generating: with tools and a long context that regularly takes
+    // minutes. The abort is only here to stop a dead connection hanging the
+    // job, so it has to be far longer than a normal response.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
     try {
       res = await fetch(route.base + "/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + route.key },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + route.key,
+          // Some CI egress filters/proxies drop outbound requests without one.
+          "User-Agent": "coderbot-agent/2 (GitHub Actions)",
+        },
+        signal: controller.signal,
         body: JSON.stringify(activeTools && activeTools.length
           ? { model: route.model, messages, tools: activeTools, tool_choice: "auto" }
           : { model: route.model, messages }),
       });
     } catch (e) {
-      if (++transient > 6) throw new Error("Network error talking to the model provider: " + ((e && e.message) || e));
+      const timedOut = e && (e.name === "AbortError" || e.name === "TimeoutError");
+      if (++transient > 6) {
+        if (timedOut) {
+          throw new Error("The model provider did not respond within " + Math.round(MODEL_TIMEOUT_MS / 60000) + " minutes, over " + transient + " attempts. Try a faster model.");
+        }
+        // Surface the real underlying cause (e.cause) rather than a bare
+        // "fetch failed", so a stuck config is diagnosable from the log.
+        const cause = (e && e.cause && e.cause.message) ? e.cause.message : "";
+        const name = (e && e.name) || "Error";
+        throw new Error("Network error talking to the model provider: " + name + ": " + ((e && e.message) || e) + (cause ? " (" + String(cause) + ")" : ""));
+      }
+      await event("status", timedOut
+        ? "The model provider did not respond in time — retrying."
+        : "Network hiccup talking to the model provider — retrying.");
       await sleep(Math.min(30000, 2000 * transient));
       continue;
+    } finally {
+      clearTimeout(timeout);
     }
     if (res.ok) {
       const body = await res.json().catch(() => null);
