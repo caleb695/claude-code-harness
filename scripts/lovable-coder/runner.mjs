@@ -45,7 +45,11 @@ async function api(p, body) {
   throw lastError || new Error(p + " failed after retries");
 }
 
-const log = async (line) => { console.log(line); try { await api("/api/public/jobs/log", { line }); } catch {} };
+const log = async (line) => { 
+  console.log(line); 
+  try { await api("/api/public/jobs/log", { line }); } 
+  catch (e) { console.error("Failed to log to app:", e); } 
+};
 
 /* The activity feed the user sees in the app. */
 let PHASE = "planning";
@@ -60,21 +64,42 @@ const event = async (kind, text, phase, agent) => {
       agent_id: agent ? agent.id : "main",
       agent_label: agent ? agent.label : "Main agent",
     });
-  } catch {}
+  } catch (e) { console.error("Failed to send event to app:", e); }
 };
 
 const sh = (cmd, opts = {}) => execSync(cmd, { stdio: ["pipe", "pipe", "pipe"], encoding: "utf8", timeout: 1000 * 60 * 10, ...opts });
 
-const MAX_STEPS = 200;
 const START = Date.now();
 const TIME_LIMIT_MS = 1000 * 60 * 60 * 5.2; // checkpoint well before the 6h wall
+
+// Mode-specific limits: build stops after task completion, debug/improve run long-term
+function getStepLimit(mode) {
+  if (mode === \"debug\" || mode === \"improve\") return Infinity; // long-running modes
+  return 200; // build/plan modes have fixed limits
+}
 
 /* ---------------------------------- tools --------------------------------- */
 
 const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", ".turbo", ".cache", "coverage", "out", ".venv", "venv", "target", ".output"]);
 const TEXT_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|kt|swift|rb|php|c|cc|cpp|h|hpp|cs|scala|sh|bash|zsh|yml|yaml|json|md|mdx|txt|toml|ini|css|scss|html|svelte|vue|astro|sql|graphql|prisma)$/i;
 
+/* ---- Caching layer for file reads and directory walks ---- */
+const fileContentCache = new Map(); // path -> { content, mtime }
+const walkCache = { data: null, mtime: 0, base: "" };
+
+function invalidateWalkCache() {
+  walkCache.data = null;
+  walkCache.mtime = 0;
+  walkCache.base = "";
+}
+
 function walk(dir, base = dir, out = []) {
+  const now = Date.now();
+  // Cache walk results for 30 seconds if base hasn't changed
+  if (walkCache.data && walkCache.base === base && now - walkCache.mtime < 30000) {
+    return walkCache.data;
+  }
+  
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return out; }
   for (const name of names) {
@@ -84,11 +109,34 @@ function walk(dir, base = dir, out = []) {
     if (st.isDirectory()) walk(p, base, out);
     else if (TEXT_EXT.test(name) && st.size <= 200000) out.push({ path: path.relative(base, p).split(path.sep).join("/"), size: st.size });
   }
+  walkCache.data = out;
+  walkCache.mtime = now;
+  walkCache.base = base;
   return out;
 }
 
-function readFileSafe(p) { try { return fs.readFileSync(p, "utf8"); } catch { return null; } }
-function writeFileSafe(p, content) { fs.mkdirSync(path.dirname(p) || ".", { recursive: true }); fs.writeFileSync(p, content, "utf8"); }
+function readFileSafe(p) {
+  // Check cache first
+  try {
+    const stats = fs.statSync(p);
+    const cached = fileContentCache.get(p);
+    if (cached && cached.mtime === stats.mtimeMs) {
+      return cached.content;
+    }
+    const content = fs.readFileSync(p, "utf8");
+    fileContentCache.set(p, { content, mtime: stats.mtimeMs });
+    return content;
+  } catch {
+    return null;
+  }
+}
+
+function writeFileSafe(p, content) {
+  fs.mkdirSync(path.dirname(p) || ".", { recursive: true });
+  fs.writeFileSync(p, content, "utf8");
+  // Invalidate cache for this file
+  fileContentCache.delete(p);
+}
 
 let TODOS = [];
 
@@ -101,6 +149,8 @@ const tools = [
     parameters: { type: "object", properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } }, required: ["path"] } } },
   { type: "function", function: { name: "read_files", description: "Read several files at once. Use this instead of many read_file calls when exploring.",
     parameters: { type: "object", properties: { paths: { type: "array", items: { type: "string" } } }, required: ["paths"] } } },
+  { type: "function", function: { name: "batch_read_files", description: "Read up to 5 files in a single call with full content. More efficient than read_files for understanding cross-file relationships. Returns each file's content separately.",
+    parameters: { type: "object", properties: { paths: { type: "array", items: { type: "string" }, maxItems: 5 } }, required: ["paths"] } } },
   { type: "function", function: { name: "search_code", description: "Search the repo for a regular expression. Returns path:line matches. Optional `path_filter` substring and `context` lines.",
     parameters: { type: "object", properties: { query: { type: "string" }, max_results: { type: "number" }, path_filter: { type: "string" }, context: { type: "number" } }, required: ["query"] } } },
   { type: "function", function: { name: "list_reference_repos", description: "List other connected GitHub repos available read-only as code references. Use these to borrow patterns or copy snippets into the repo you are editing.",
@@ -117,6 +167,8 @@ const tools = [
     parameters: { type: "object", properties: { path: { type: "string" }, find: { type: "string" }, replace: { type: "string" }, replace_all: { type: "boolean" } }, required: ["path", "find", "replace"] } } },
   { type: "function", function: { name: "multi_edit", description: "Apply several find/replace edits, optionally across several files, in one atomic call. All edits must match or none are applied.",
     parameters: { type: "object", properties: { edits: { type: "array", items: { type: "object", properties: { path: { type: "string" }, find: { type: "string" }, replace: { type: "string" }, replace_all: { type: "boolean" } }, required: ["path", "find", "replace"] } } }, required: ["edits"] } } },
+  { type: "function", function: { name: "batch_edit_files", description: "Apply the same find/replace edit across up to 10 files at once. Useful for renaming functions, updating imports, or making consistent changes across multiple files.",
+    parameters: { type: "object", properties: { find: { type: "string" }, replace: { type: "string" }, paths: { type: "array", items: { type: "string" }, maxItems: 10 } }, required: ["find", "replace", "paths"] } } },
   { type: "function", function: { name: "delete_file", description: "Delete a file.",
     parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } },
   { type: "function", function: { name: "move_file", description: "Rename or move a file, creating parent directories as needed.",
@@ -148,7 +200,7 @@ const DELEGATE_TOOL = { type: "function", function: {
 } };
 
 /* Read-only tools can safely run at the same time within one assistant turn. */
-const READ_ONLY_TOOLS = new Set(["list_files", "glob", "read_file", "read_files", "search_code", "git_diff", "fetch_url", "search_web", "list_reference_repos", "list_reference_files", "read_reference_file", "search_reference_code"]);
+const READ_ONLY_TOOLS = new Set(["list_files", "glob", "read_file", "read_files", "batch_read_files", "search_code", "git_diff", "fetch_url", "search_web", "list_reference_repos", "list_reference_files", "read_reference_file", "search_reference_code"]);
 
 /* Tools available to the model this step. `finish` and `delegate` are main-agent only. */
 function toolsFor(kind, subAgents) {
@@ -447,6 +499,14 @@ async function execTool(name, args) {
         return "--- " + p + " ---\n" + (c == null ? "(not found)" : c.slice(0, 20000));
       }).join("\n\n").slice(0, 80000) || "ERR: no paths given";
     }
+    if (name === "batch_read_files") {
+      const paths = Array.isArray(args.paths) ? args.paths.slice(0, 5) : [];
+      if (!paths.length) return "ERR: no paths given";
+      return paths.map((p) => {
+        const c = readFileSafe(p);
+        return "=== FILE: " + p + " ===\n" + (c == null ? "ERROR: File not found" : c);
+      }).join("\n\n");
+    }
     if (name === "search_code") {
       let re; try { re = new RegExp(args.query, "i"); } catch (e) { return "ERR: bad pattern " + e.message; }
       const limit = Math.min(args.max_results || 60, 200);
@@ -499,6 +559,23 @@ async function execTool(name, args) {
       for (const [p, content] of staged) writeFileSafe(p, content);
       return "OK applied " + edits.length + " edits to " + [...staged.keys()].join(", ");
     }
+    if (name === "batch_edit_files") {
+      const paths = Array.isArray(args.paths) ? args.paths.slice(0, 10) : [];
+      if (!paths.length) return "ERR: no paths given";
+      if (!args.find) return "ERR: find text required";
+      let successCount = 0;
+      let failedPaths = [];
+      for (const p of paths) {
+        const c = readFileSafe(p);
+        if (c == null) { failedPaths.push(p + " (not found)"); continue; }
+        if (!c.includes(args.find)) { failedPaths.push(p + " (find text not present)"); continue; }
+        const next = c.replace(args.find, args.replace ?? "");
+        writeFileSafe(p, next);
+        successCount++;
+      }
+      if (successCount === 0) return "ERR: no edits succeeded. Failures: " + failedPaths.join("; ");
+      return "OK edited " + successCount + "/" + paths.length + " files. Failures: " + (failedPaths.length ? failedPaths.join("; ") : "none");
+    }
     if (name === "delete_file") { fs.unlinkSync(args.path); return "OK deleted " + args.path; }
     if (name === "move_file") {
       const c = readFileSafe(args.from);
@@ -549,7 +626,7 @@ function chatRoute(spec, model) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* Upper bound for one (non-streamed) completion request. */
-const MODEL_TIMEOUT_MS = 1000 * 60 * 10;
+const MODEL_TIMEOUT_MS = 1000 * 60 * 30;
 
 /* Per-minute rate limits: wait 10s and retry (up to ~50 minutes of waiting).
  * Transient network/5xx failures back off and retry a few times.
@@ -616,6 +693,9 @@ async function callModel(spec, messages, opts = {}) {
       if (++rpmWaits <= 300) {
         if (rpmWaits === 1 || rpmWaits % 6 === 0) {
           await event("status", "Rate limited — waiting and retrying (" + rpmWaits * 10 + "s so far).", undefined, opts.agent);
+        } else {
+          // Log every wait to console so user sees progress in GitHub Actions log
+          await log("Rate limited — waiting and retrying (" + rpmWaits * 10 + "s so far).");
         }
         await sleep(10000);
         continue;
@@ -624,6 +704,7 @@ async function callModel(spec, messages, opts = {}) {
     }
     if (res.status >= 500 || res.status === 408) {
       if (++transient > 6) throw new Error("Provider error " + res.status + ": " + text);
+      await event("status", "Provider error " + res.status + " — retrying.", undefined, opts.agent);
       await sleep(Math.min(30000, 2000 * transient));
       continue;
     }
@@ -729,7 +810,7 @@ function verb(name, args) {
   return name;
 }
 
-const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "delete_file", "move_file"]);
+const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "batch_edit_files", "delete_file", "move_file"]);
 
 /* Files each sub-agent has been given, so two agents never edit the same file. */
 const FILE_OWNER = new Map();
@@ -851,15 +932,17 @@ async function runSubAgent(spec, agent, task, ownFiles) {
   return "Sub-agent " + agent.id + " hit its step limit; check its work.";
 }
 
-/* Execute one assistant turn's tool calls. Read-only calls run concurrently,
- * writes and shell commands run in order so they can't race each other. */
+/* Execute one assistant turn's tool calls. Read-only calls run concurrently.
+ * Write calls run with file-level locking: writes to DIFFERENT files can run in parallel,
+ * writes to the SAME file are serialized. This enables true parallel sub-agent execution. */
 async function runToolCalls(calls, agent, onTool) {
   const results = new Map();
   const parse = (c) => { try { return JSON.parse((c.function && c.function.arguments) || "{}"); } catch { return {}; } };
 
   const reads = calls.filter((c) => READ_ONLY_TOOLS.has(c.function.name));
-  const rest = calls.filter((c) => !READ_ONLY_TOOLS.has(c.function.name));
+  const writes = calls.filter((c) => !READ_ONLY_TOOLS.has(c.function.name));
 
+  // Read-only tools: fully parallel
   await Promise.all(reads.map(async (c) => {
     const args = parse(c);
     await event("action", verb(c.function.name, args), undefined, agent);
@@ -867,28 +950,55 @@ async function runToolCalls(calls, agent, onTool) {
     results.set(c.id, String(await execTool(c.function.name, args)).slice(0, 40000));
   }));
 
-  for (const c of rest) {
+  // Write tools: group by file path, run each group in parallel, files within group serialized
+  // This allows sub-agents working on different files to run truly in parallel
+  const writeGroups = new Map();
+  for (const c of writes) {
     const args = parse(c);
     const name = c.function.name;
     if (name === "delegate") { results.set(c.id, "ERR: sub-agents cannot delegate"); continue; }
+    
+    // Determine files this write affects
+    let files = [];
+    if (name === "multi_edit") {
+      files = (args.edits || []).map((e) => e.path);
+    } else if (name === "move_file") {
+      files = [args.from, args.to];
+    } else if (args.path) {
+      files = [args.path];
+    }
+    
+    // Check file ownership for sub-agents
     if (agent && WRITE_TOOLS.has(name) && agent.ownFiles && agent.ownFiles.length) {
-      const requested = name === "multi_edit" ? (args.edits || []).map((e) => e.path)
-        : name === "move_file" ? [args.from, args.to]
-        : [args.path];
-      const outside = requested.filter((p) => p && !agent.ownFiles.includes(p));
+      const outside = files.filter((p) => p && !agent.ownFiles.includes(p));
       if (outside.length) {
         results.set(c.id, "ERR: outside your assigned files: " + outside.join(", "));
         continue;
       }
     }
-    await event("action", verb(name, args), undefined, agent);
-    onTool(name, args);
-    const run = () => execTool(name, args);
-    const output = WRITE_TOOLS.has(name) || name === "run_shell" || name === "check_code"
-      ? await serialized(run)
-      : await run();
-    results.set(c.id, String(output).slice(0, 40000));
+    
+    // Group by primary file (first file for multi-file ops)
+    const primaryFile = files[0] || name; // fallback to tool name for run_shell, check_code
+    if (!writeGroups.has(primaryFile)) writeGroups.set(primaryFile, []);
+    writeGroups.get(primaryFile).push({ call: c, args, name, files });
   }
+
+  // Execute each file group in parallel, but serialize within group
+  await Promise.all(Array.from(writeGroups.entries()).map(async ([primaryFile, group]) => {
+    // Serialize within this file group
+    await serialized(async () => {
+      for (const { call, args, name, files } of group) {
+        await event("action", verb(name, args), undefined, agent);
+        onTool(name, args);
+        const run = () => execTool(name, args);
+        const output = WRITE_TOOLS.has(name) || name === "run_shell" || name === "check_code"
+          ? await run()
+          : await run();
+        results.set(call.id, String(output).slice(0, 40000));
+      }
+    });
+  }));
+
   return results;
 }
 
@@ -936,10 +1046,45 @@ async function main() {
   let lastErrorSig = null;
   let errorStreak = 0;
 
-  for (let step = 0; step < MAX_STEPS; step++) {
+  const mode = spec.mode || "build";
+  const stepLimit = getStepLimit(mode);
+  let brainstormingPhase = false;
+  let ideasExhausted = false;
+  let lastMessageCount = messages.length;
+
+  // Poll for new user messages during long-running sessions (debug/improve modes)
+  async function checkForNewMessages() {
+    if (mode !== "debug" && mode !== "improve") return;
+    try {
+      const r = await fetch(APP_URL + "/api/public/jobs/new-messages", {
+        method: "POST",
+        headers: HEAD,
+        body: JSON.stringify({ lastMessageCount }),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        if (data.newMessages && data.newMessages.length > 0) {
+          await log("Received " + data.newMessages.length + " new user message(s) while working");
+          for (const msg of data.newMessages) {
+            messages.push({ role: "user", content: msg.content });
+          }
+          lastMessageCount += data.newMessages.length;
+          await event("status", "Incorporating new user feedback into current work.", "planning");
+        }
+      }
+    } catch (e) {
+      // Silently ignore - don't interrupt the run for polling errors
+    }
+  }
+
+  for (let step = 0; step < stepLimit; step++) {
     if (Date.now() - START > TIME_LIMIT_MS) {
       await checkpointAndContinue(messages);
       return;
+    }
+    // Check for new user messages every 3 steps in long-running modes
+    if (step > 0 && step % 3 === 0) {
+      await checkForNewMessages();
     }
     try {
     messages = await compactIfNeeded(spec, messages);
@@ -954,8 +1099,40 @@ async function main() {
 
     const calls = msg.tool_calls || [];
     if (calls.length === 0) {
-      // The model stopped calling tools. If it never verified its edits, nudge
-      // it once instead of silently finishing on unchecked work.
+      // Model returned no tool calls. If this is the FIRST turn with no content,
+      // nudge it to start working instead of silently finishing.
+      if (!msg.content || !String(msg.content).trim()) {
+        await event("status", "Model returned empty response — nudging to start working.", PHASE);
+        messages.push({ role: "user", content: "Your previous response was empty. Please start working by calling tools (read_file, write_file, search_code, etc.) or explain your plan." });
+        continue;
+      }
+      // The model stopped calling tools. Handle differently based on mode.
+      if (mode === "debug" || mode === "improve") {
+        // Long-running modes: brainstorm for more work or check if done
+        if (!brainstormingPhase && !ideasExhausted) {
+          // Enter brainstorming phase to find more improvements/bugs
+          brainstormingPhase = true;
+          const prompt = mode === \"debug\"
+            ? \"You have not identified any more bugs to fix. Take a systematic approach: review the codebase for potential issues like error handling gaps, edge cases, performance bottlenecks, security concerns, or logic errors. List specific files and line numbers where problems might exist, then investigate and fix them. Only call finish when you've thoroughly checked and found nothing else to debug.\"
+            : \"You have not identified any more improvements. Brainstorm systematically: review the codebase for optimization opportunities, code quality improvements, missing features that would add value, refactoring chances to reduce duplication, better patterns to adopt, or hardening of weak spots. List specific improvements with file locations, then implement them. Only call finish when you've exhausted meaningful improvements.\";
+          messages.push({ role: "user", content: prompt });
+          continue;
+        }
+        if (brainstormingPhase && noProgress === 0) {
+          // Gave it a chance to brainstorm but still no tool calls - mark as exhausted
+          ideasExhausted = true;
+          noProgress++;
+          messages.push({ role: "user", content: "If you genuinely cannot find any more " + (mode === "debug" ? "bugs" : "improvements") + " after systematic review, explain what you checked and why nothing else needs attention, then call finish. Otherwise, start investigating specific areas you mentioned." });
+          continue;
+        }
+        if (ideasExhausted) {
+          // Truly exhausted - allow finish
+          done = { summary: msg.content || "No more " + mode + " opportunities found.", commit_message: "Coderbot " + mode + " session complete" };
+          break;
+        }
+      }
+      
+      // Build/plan mode or fallback: normal finish behavior
       if (sawWrite && !sawCheck && noProgress === 0) {
         noProgress++;
         messages.push({ role: "user", content: "You changed files but never ran check_code. Run it now, fix anything it reports, then call finish." });
